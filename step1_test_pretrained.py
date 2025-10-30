@@ -1,3 +1,8 @@
+"""
+Step 1: Test Pretrained FCN-ResNet50 on PASCAL VOC 2012
+MAC-COMPATIBLE VERSION - Fixes multiprocessing and lambda issues
+"""
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -6,6 +11,8 @@ from torchvision.datasets import VOCSegmentation
 from torchvision.models.segmentation import fcn_resnet50, FCN_ResNet50_Weights
 import numpy as np
 from tqdm import tqdm
+import os
+import sys
 
 
 class MeanIoU:
@@ -54,6 +61,25 @@ class MeanIoU:
         return mean_iou, iou
 
 
+# Define target transform as a proper class (not lambda) for Mac compatibility
+class TargetTransform:
+    """Transform target segmentation mask"""
+    def __init__(self, size=(520, 520)):
+        self.size = size
+    
+    def __call__(self, target):
+        # Resize with nearest neighbor interpolation
+        target = transforms.functional.resize(
+            target, 
+            self.size, 
+            interpolation=transforms.InterpolationMode.NEAREST
+        )
+        # Convert to tensor and squeeze
+        target = transforms.functional.pil_to_tensor(target)
+        target = target.squeeze(0).long()
+        return target
+
+
 def evaluate_model(model, dataloader, device):
     """Evaluate model on dataset"""
     model.eval()
@@ -75,12 +101,24 @@ def evaluate_model(model, dataloader, device):
     return mean_iou, class_iou
 
 
+def check_dataset_exists(data_root='./data'):
+    """Check if PASCAL VOC 2012 dataset already exists"""
+    voc_path = os.path.join(data_root, 'VOCdevkit', 'VOC2012')
+    if os.path.exists(voc_path):
+        # Check for essential files
+        imagesets_path = os.path.join(voc_path, 'ImageSets', 'Segmentation', 'val.txt')
+        if os.path.exists(imagesets_path):
+            print(f"✓ Found existing PASCAL VOC 2012 dataset at: {voc_path}")
+            return True
+    return False
+
+
 def main():
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
     print(f"Using device: {device}")
     
-    # Define transforms
+    # Define transforms (no lambda functions for Mac compatibility)
     transform = transforms.Compose([
         transforms.Resize((520, 520)),  # Slightly larger for better results
         transforms.ToTensor(),
@@ -88,36 +126,58 @@ def main():
                            std=[0.229, 0.224, 0.225])
     ])
     
-    target_transform = transforms.Compose([
-        transforms.Resize((520, 520), interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.PILToTensor(),
-        transforms.Lambda(lambda x: x.squeeze(0).long())  # Remove channel dim and convert to long
-    ])
+    # Use proper class instead of lambda
+    target_transform = TargetTransform(size=(520, 520))
+    
+    # Check if dataset already exists
+    print("Checking for existing PASCAL VOC 2012 dataset...")
+    dataset_exists = check_dataset_exists('./data')
+    
+    if not dataset_exists:
+        print("❌ Dataset not found!")
+        print("Please ensure the dataset is at: ./data/VOCdevkit/VOC2012/")
+        sys.exit(1)
     
     # Load PASCAL VOC 2012 dataset
     print("Loading PASCAL VOC 2012 dataset...")
-    test_dataset = VOCSegmentation(
-        root='./data',
-        year='2012',
-        image_set='val',  # Using validation set as test set
-        download=True,
-        transform=transform,
-        target_transform=target_transform
-    )
+    try:
+        test_dataset = VOCSegmentation(
+            root='./data',
+            year='2012',
+            image_set='val',  # Using validation set as test set
+            download=False,  # Don't try to download since we have it
+            transform=transform,
+            target_transform=target_transform
+        )
+    except Exception as e:
+        print(f"❌ Error loading dataset: {e}")
+        sys.exit(1)
     
+    print(f"✓ Dataset loaded successfully!")
+    print(f"Test dataset size: {len(test_dataset)}")
+    
+    # IMPORTANT: Set num_workers=0 for Mac to avoid multiprocessing issues
     test_loader = DataLoader(
         test_dataset,
         batch_size=8,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,  # Set to 0 for Mac compatibility
+        pin_memory=True if torch.cuda.is_available() else False
     )
     
-    print(f"Test dataset size: {len(test_dataset)}")
-    
     # Load pretrained FCN-ResNet50
-    print("Loading pretrained FCN-ResNet50...")
-    model = fcn_resnet50(weights=FCN_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1)
+    print("\nLoading pretrained FCN-ResNet50...")
+    try:
+        model = fcn_resnet50(weights=FCN_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1)
+    except Exception as e:
+        print(f"⚠️  Error loading with new API: {e}")
+        print("Trying alternative method...")
+        try:
+            model = fcn_resnet50(pretrained=True)
+        except Exception as e2:
+            print(f"❌ Failed to load model: {e2}")
+            sys.exit(1)
+    
     model = model.to(device)
     
     # Count parameters
@@ -125,7 +185,8 @@ def main():
     print(f"Total parameters: {total_params:,}")
     
     # Evaluate
-    print("Starting evaluation...")
+    print("\nStarting evaluation...")
+    print("(This may take a few minutes...)")
     mean_iou, class_iou = evaluate_model(model, test_loader, device)
     
     # Print results
@@ -144,6 +205,8 @@ def main():
     print("\nPer-class IoU:")
     for i, (cls_name, iou) in enumerate(zip(voc_classes, class_iou)):
         print(f"{cls_name:15s}: {iou:.4f}")
+    
+    print("\n✓ Evaluation complete!")
 
 
 if __name__ == "__main__":
