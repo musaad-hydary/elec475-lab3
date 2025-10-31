@@ -33,20 +33,43 @@ class TargetTransform:
         return target.squeeze(0).long()
 
 
+class FeatureProjection(nn.Module):
+    """Project features to match dimensions for distillation"""
+    def __init__(self, in_channels, out_channels):
+        super(FeatureProjection, self).__init__()
+        self.projection = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def forward(self, x):
+        return self.projection(x)
+
+
 class DistillationLoss(nn.Module):
     """Combined distillation loss: Response-based + Feature-based"""
     
     def __init__(self, alpha=0.5, beta=0.5, temperature=4.0, 
-                 feature_weight=0.3, num_classes=21):
+                 feature_weight=0.3, num_classes=21, device='mps'):
         super(DistillationLoss, self).__init__()
         self.alpha = alpha
         self.beta = beta
         self.temperature = temperature
         self.feature_weight = feature_weight
         self.num_classes = num_classes
+        self.device = device
         
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=255)
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')
+        
+        # Feature projections to match teacher dimensions
+        # Student: low=24, mid=40, high=576
+        # Teacher: low=256, mid=512, high=2048
+        self.projections = nn.ModuleDict({
+            'low': FeatureProjection(24, 256),
+            'mid': FeatureProjection(40, 512),
+            'high': FeatureProjection(576, 2048)
+        }).to(device)
     
     def response_based_loss(self, student_logits, teacher_logits, targets):
         """Response-based distillation loss"""
@@ -71,14 +94,22 @@ class DistillationLoss(nn.Module):
     
     def cosine_similarity_loss(self, student_feat, teacher_feat):
         """Feature-based distillation using cosine similarity"""
+        # Normalize features channel-wise
         student_norm = F.normalize(student_feat, p=2, dim=1)
         teacher_norm = F.normalize(teacher_feat, p=2, dim=1)
+        
+        # Cosine similarity per spatial location
         cos_sim = (student_norm * teacher_norm).sum(dim=1)
+        
+        # Loss is 1 - similarity (minimize distance)
         loss = (1 - cos_sim).mean()
         return loss
     
     def feature_based_loss(self, student_features, teacher_features):
-        """Feature-based distillation loss"""
+        """
+        Feature-based distillation loss with proper dimension matching
+        Projects student features to match teacher dimensions
+        """
         total_loss = 0.0
         num_levels = 0
         
@@ -87,8 +118,8 @@ class DistillationLoss(nn.Module):
                 student_feat = student_features[level]
                 teacher_feat = teacher_features[level]
                 
-                # Resize to match
-                if student_feat.shape != teacher_feat.shape:
+                # Resize spatially to match
+                if student_feat.shape[2:] != teacher_feat.shape[2:]:
                     teacher_feat = F.interpolate(
                         teacher_feat, 
                         size=student_feat.shape[2:],
@@ -96,7 +127,11 @@ class DistillationLoss(nn.Module):
                         align_corners=False
                     )
                 
-                loss = self.cosine_similarity_loss(student_feat, teacher_feat)
+                # Project student features to match teacher channels
+                student_feat_proj = self.projections[level](student_feat)
+                
+                # Now dimensions should match
+                loss = self.cosine_similarity_loss(student_feat_proj, teacher_feat)
                 total_loss += loss
                 num_levels += 1
         
@@ -134,12 +169,15 @@ class TeacherModel(nn.Module):
             x = backbone.relu(x)
             x = backbone.maxpool(x)
             
+            # Layer 1 (low-level, stride 4, 256 channels)
             x = backbone.layer1(x)
             features['low'] = x
             
+            # Layer 2 (mid-level, stride 8, 512 channels)
             x = backbone.layer2(x)
             features['mid'] = x
             
+            # Layer 3 and 4 (high-level, stride 16, 2048 channels)
             x = backbone.layer3(x)
             x = backbone.layer4(x)
             features['high'] = x
@@ -169,19 +207,31 @@ class KnowledgeDistillationTrainer:
         os.makedirs(save_dir, exist_ok=True)
         
         self.distill_loss = DistillationLoss(
-            alpha=alpha, beta=beta, temperature=temperature, feature_weight=feature_weight
+            alpha=alpha, beta=beta, temperature=temperature, 
+            feature_weight=feature_weight, device=device
         )
         
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=255)
         
-        # Optimizer
-        params = [
-            {'params': student_model.features.parameters(), 'lr': learning_rate * 0.1},
-            {'params': student_model.aspp.parameters(), 'lr': learning_rate},
-            {'params': student_model.low_level_project.parameters(), 'lr': learning_rate},
-            {'params': student_model.decoder.parameters(), 'lr': learning_rate},
-            {'params': student_model.classifier.parameters(), 'lr': learning_rate}
-        ]
+        # Optimizer - include projection layers for feature-based methods
+        if method == 'feature' or method == 'both':
+            params = [
+                {'params': student_model.features.parameters(), 'lr': learning_rate * 0.1},
+                {'params': student_model.aspp.parameters(), 'lr': learning_rate},
+                {'params': student_model.low_level_project.parameters(), 'lr': learning_rate},
+                {'params': student_model.decoder.parameters(), 'lr': learning_rate},
+                {'params': student_model.classifier.parameters(), 'lr': learning_rate},
+                {'params': self.distill_loss.projections.parameters(), 'lr': learning_rate}  # Add projections
+            ]
+        else:
+            params = [
+                {'params': student_model.features.parameters(), 'lr': learning_rate * 0.1},
+                {'params': student_model.aspp.parameters(), 'lr': learning_rate},
+                {'params': student_model.low_level_project.parameters(), 'lr': learning_rate},
+                {'params': student_model.decoder.parameters(), 'lr': learning_rate},
+                {'params': student_model.classifier.parameters(), 'lr': learning_rate}
+            ]
+        
         self.optimizer = optim.Adam(params, lr=learning_rate)
         
         self.scheduler = optim.lr_scheduler.PolynomialLR(
@@ -197,10 +247,11 @@ class KnowledgeDistillationTrainer:
         """Train for one epoch with knowledge distillation"""
         self.student.train()
         self.teacher.eval()
+        self.distill_loss.projections.train()  # Ensure projections are trainable
         
         running_loss = 0.0
         
-        pbar = tqdm(self.train_loader, desc="Training with KD")
+        pbar = tqdm(self.train_loader, desc=f"Training with {self.method} KD")
         for images, targets in pbar:
             images = images.to(self.device)
             targets = targets.to(self.device)
@@ -247,7 +298,10 @@ class KnowledgeDistillationTrainer:
             self.optimizer.step()
             
             running_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'gt': gt_loss.item()})
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'gt': f'{gt_loss.item():.4f}'
+            })
         
         return running_loss / len(self.train_loader)
     
@@ -319,6 +373,7 @@ class KnowledgeDistillationTrainer:
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.student.state_dict(),
+            'projection_state_dict': self.distill_loss.projections.state_dict() if self.method in ['feature', 'both'] else None,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
@@ -351,6 +406,7 @@ class KnowledgeDistillationTrainer:
         
         plt.tight_layout()
         plt.savefig(os.path.join(self.save_dir, f'training_curves_{self.method}.png'), dpi=300)
+        print(f"Training curves saved to {self.save_dir}/training_curves_{self.method}.png")
         plt.close()
 
 
@@ -418,8 +474,11 @@ def main():
     student = StudentSegmentationModel(num_classes=21, pretrained=True).to(device)
     teacher = TeacherModel().to(device)
     
-    print(f"Student parameters: {sum(p.numel() for p in student.parameters()):,}")
-    print(f"Teacher parameters: {sum(p.numel() for p in teacher.parameters()):,}")
+    student_params = sum(p.numel() for p in student.parameters())
+    teacher_params = sum(p.numel() for p in teacher.parameters())
+    
+    print(f"Student parameters: {student_params:,}")
+    print(f"Teacher parameters: {teacher_params:,}")
     
     # Trainer
     save_dir = f'checkpoints_kd_{args.method}'
